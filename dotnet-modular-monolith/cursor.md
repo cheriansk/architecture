@@ -2,18 +2,13 @@
 
 In a **Schema-per-Tenant** architecture using PostgreSQL and EF Core, each tenant gets their own dedicated database schema (e.g. `tenant_a`, `tenant_b`). Within each tenant's schema, tables are isolated by module using table prefixes (e.g. `catalog_products`, `ordering_orders`).
 
-To implement this efficiently in .NET without memory bloat or startup lag, we use PostgreSQL's native **`search_path`** connection setting.
+To ensure total data isolation and avoid connection setup complexity, we map all tables using dynamic schema-qualified mappings: `ToTable("table_name", schema)`.
 
 ---
 
-## 1. The PostgreSQL `search_path` Pattern
+## 1. Architectural Blueprint (Dynamic Schema Mapping)
 
-Normally, dynamically changing schemas in EF Core requires overriding `OnModelCreating` per request. However, EF Core caches database models globally based on context configurations. Changing schemas dynamically forces EF Core to rebuild and cache a separate model metadata tree for every single tenant, resulting in **extreme memory leaks and slow requests**.
-
-By using PostgreSQL's **`search_path`**, we solve this:
-1. **Schema-less EF Mapping**: We map entities to bare table names (`catalog_products`, `ordering_orders`) without specifying any schema in C#.
-2. **Dynamic Connection Scoping**: On opening a database connection, a `DbConnectionInterceptor` executes `SET LOCAL search_path TO tenant_a, public;`.
-3. **Database-level Routing**: PostgreSQL automatically maps the schema-less queries (e.g. `SELECT * FROM catalog_products`) to the active tenant's schema (`tenant_a.catalog_products`). Shared global tables can live in the `public` schema.
+Every table is mapped directly to a specific schema at runtime. To prevent EF Core from caching a single schema mapping globally (which would cause tenant data leakage), we implement a custom **Model Cache Key Factory** that instructs EF Core to cache separate models for each tenant.
 
 ```mermaid
 graph TD
@@ -21,15 +16,24 @@ graph TD
     Request[HTTP Request] -->|Headers: X-Tenant-Id| TenantMiddleware[Tenant Middleware]
     TenantMiddleware -->|Resolves Schema 'tenant_a'| TenantProvider[ITenantProvider]
     
-    %% EF Core and Interceptor
-    EF[EF Core DbContext] -->|Open Connection| Interceptor[TenantConnectionInterceptor]
-    Interceptor -->|Runs SQL| PG[(PostgreSQL)]
-    note[SET LOCAL search_path TO tenant_a, public;] --> Interceptor
+    %% EF Core Scoped Context
+    TenantProvider -->|Injects tenant_a| DbContext[CatalogDbContext]
+    DbContext -->|Assembles model using tenant_a| OnModelCreating[OnModelCreating: ToTable('catalog_products', 'tenant_a')]
     
-    %% PG Search Path mapping
-    PG -->|Routes queries to| TenantSchema[tenant_a.catalog_products]
-    PG -->|Fallback for global tables| PublicSchema[public.tenant_registry]
+    %% Model Caching
+    OnModelCreating -->|Consults Cache Key| ModelCache[TenantModelCacheKeyFactory]
+    ModelCache -->|Returns cache key with tenant_a| EFModelCache[(EF Core Model Cache)]
+    
+    %% Database routing
+    DbContext -->|Generates SQL| SQL[SELECT * FROM tenant_a.catalog_products]
+    SQL --> PG[(PostgreSQL Database)]
 ```
+
+### Key Architectural Guidelines:
+1. **Dynamic Schema Mapping**: Use `ToTable("table_name", schema)` inside `OnModelCreating`.
+2. **Model Cache Key Separation**: Create a custom `IModelCacheKeyFactory` to generate cache keys that contain the active tenant schema.
+3. **No `tenant_id` Column**: Physical schema isolation makes tenant ID columns redundant.
+4. **Per-Schema Migrations History**: Place the `__EFMigrationsHistory` table inside the tenant's schema to track migrations independently.
 
 ---
 
@@ -48,10 +52,10 @@ Monolith/
 │       ├── ...
 ├── Shared/
 │   ├── Domain/                     # Common DDD base classes & ITenantProvider
-│   ├── Infrastructure/             # TenantConnectionInterceptor, TenantProvisioningService
+│   ├── Infrastructure/             # TenantModelCacheKeyFactory, TenantProvisioningService
 │   └── UI/                         # Layouts and global CSS
 ├── Program.cs                      # Main entrypoint: registers TenantProvider, DbContexts, maps UI
-└── Monolith.csproj                 # Single project managing all NuGet dependencies
+└── Monolith.csproj                 # Single project file
 ```
 
 ---
@@ -59,8 +63,6 @@ Monolith/
 ## 3. Key Implementation Patterns
 
 ### Pattern A: Tenant Provider (In `Monolith/Shared/Domain`)
-
-Resolves the current tenant's schema name from the HTTP context.
 
 ```csharp
 namespace Monolith.Shared.Domain;
@@ -73,61 +75,74 @@ public interface ITenantProvider
 
 ---
 
-### Pattern B: Connection Interceptor (In `Monolith/Shared/Infrastructure`)
+### Pattern B: EF Core Model Cache Key Factory (In `Monolith/Shared/Infrastructure`)
 
-Intercepts connection events and applies the search path.
+This is critical. Without this, EF Core will only execute queries against the schema of the first tenant that booted the application.
 
 ```csharp
-using System.Data.Common;
-using Microsoft.EntityFrameworkCore.Diagnostics;
-using Monolith.Shared.Domain;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 
 namespace Monolith.Shared.Infrastructure;
 
-public class TenantConnectionInterceptor(ITenantProvider tenantProvider) : DbConnectionInterceptor
+public class TenantModelCacheKeyFactory : IModelCacheKeyFactory
 {
-    public override async ValueTask ConnectionOpenedAsync(
-        DbConnection connection,
-        ConnectionEndEventData eventData,
-        CancellationToken cancellationToken = default)
+    public object Create(DbContext context, bool designTime)
     {
-        await base.ConnectionOpenedAsync(connection, eventData, cancellationToken);
+        // Generate a cache key combining the DbContext type and the current tenant schema
+        if (context is ITenantDbContext tenantContext)
+        {
+            return (context.GetType(), tenantContext.TenantSchema, designTime);
+        }
         
-        var tenantSchema = tenantProvider.GetTenantSchema();
-        
-        await using var command = connection.CreateCommand();
-        // Sets the search path for the duration of the transaction/connection
-        // Always sanitize tenantSchema parameter or validate it against a list of active tenants!
-        command.CommandText = $"SET LOCAL search_path TO \"{tenantSchema}\", public;";
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        return (context.GetType(), designTime);
     }
+}
+
+// Marker interface for Tenant DbContexts
+public interface ITenantDbContext
+{
+    string TenantSchema { get; }
 }
 ```
 
 ---
 
-### Pattern C: DbContext Configurations (In `Monolith/Modules/Catalog/Infrastructure`)
+### Pattern C: DbContext with Dynamic Schema Mapping (In `Monolith/Modules/Catalog/Infrastructure`)
 
-Map tables using prefixes, but **do not** define default schemas or specify schema parameters.
+Map tables using the injected schema name.
 
 ```csharp
 using Microsoft.EntityFrameworkCore;
+using Monolith.Shared.Domain;
+using Monolith.Shared.Infrastructure;
 using Monolith.Modules.Catalog.Domain;
 
 namespace Monolith.Modules.Catalog.Infrastructure;
 
-internal class CatalogDbContext(DbContextOptions<CatalogDbContext> options) : DbContext(options)
+internal class CatalogDbContext : DbContext, ITenantDbContext
 {
+    private readonly string _tenantSchema;
+
+    public CatalogDbContext(
+        DbContextOptions<CatalogDbContext> options,
+        ITenantProvider tenantProvider) : base(options)
+    {
+        _tenantSchema = tenantProvider.GetTenantSchema();
+    }
+
+    public string TenantSchema => _tenantSchema;
+
     public DbSet<Product> Products => Set<Product>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
 
-        // Map Catalog entities to prefixed, schema-less tables
+        // Dynamically map tables to the tenant schema
         modelBuilder.Entity<Product>(builder =>
         {
-            builder.ToTable("catalog_products"); // Schema-less table name
+            builder.ToTable("catalog_products", _tenantSchema); // table, schema
             builder.HasKey(p => p.Id);
             builder.Property(p => p.Name).IsRequired().HasMaxLength(200);
         });
@@ -137,31 +152,65 @@ internal class CatalogDbContext(DbContextOptions<CatalogDbContext> options) : Db
 
 ---
 
-## 4. Tenant Provisioning & Dynamic Migrations
+### Pattern D: Dynamic DB Registration & Per-Schema Migrations (In `Monolith/Program.cs`)
 
-When onboarding a new tenant, you must dynamically create their PostgreSQL schema and apply EF Core migrations against it.
-
-### Implementing TenantProvisioningService (In `Monolith/Shared/Infrastructure`)
+Configure the DB Context options to write the migrations history table dynamically inside the tenant's schema:
 
 ```csharp
 using Microsoft.EntityFrameworkCore;
-using Npgsql;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Monolith.Shared.Domain;
+using Monolith.Shared.Infrastructure;
+using Monolith.Modules.Catalog.Infrastructure;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// 1. Register Tenant Provider
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped<ITenantProvider, HttpTenantProvider>();
+
+// 2. Register Custom Model Cache Key Factory
+builder.Services.AddSingleton<IModelCacheKeyFactory, TenantModelCacheKeyFactory>();
+
+// 3. Register DbContext with dynamic options
+builder.Services.AddDbContext<CatalogDbContext>((sp, options) =>
+{
+    var tenantProvider = sp.GetRequiredService<ITenantProvider>();
+    var schema = tenantProvider.GetTenantSchema();
+    
+    options.UseNpgsql(
+        builder.Configuration.GetConnectionString("DefaultConnection"),
+        npgsqlOptions => 
+        {
+            // Directs migration history to live in the tenant's schema
+            npgsqlOptions.MigrationsHistoryTable("__EFMigrationsHistory", schema);
+        }
+    );
+});
+```
+
+---
+
+## 4. Tenant Provisioning & Dynamic Migrations
+
+To onboard a new tenant, dynamically create the schema and execute migrations. Because migrations history is per-schema, migrations run independently for each tenant.
+
+```csharp
+using Microsoft.EntityFrameworkCore;
 
 namespace Monolith.Shared.Infrastructure;
 
-public class TenantProvisioningService(
-    DbContextOptions<CatalogDbContext> dbContextOptions) // Inject DB options
+public class TenantProvisioningService(CatalogDbContext context)
 {
     public async Task ProvisionTenantAsync(string tenantSchema)
     {
-        // 1. Sanitize schema name to prevent SQL Injection
+        // 1. Sanitize schema name to prevent SQL injection
         if (string.IsNullOrWhiteSpace(tenantSchema) || !tenantSchema.All(c => char.IsLetterOrDigit(c) || c == '_'))
         {
             throw new ArgumentException("Invalid tenant schema name.");
         }
 
-        // 2. Create the schema and the Migration History table target connection
-        using var context = new DbContext(dbContextOptions);
+        // 2. Create the schema in PostgreSQL
         var connection = context.Database.GetDbConnection();
         await connection.OpenAsync();
 
@@ -171,16 +220,9 @@ public class TenantProvisioningService(
             await command.ExecuteNonQueryAsync();
         }
 
-        // 3. Set search path to target the new tenant schema for migration execution
-        await using (var command = connection.CreateCommand())
-        {
-            command.CommandText = $"SET search_path TO \"{tenantSchema}\";";
-            await command.ExecuteNonQueryAsync();
-        }
-
-        // 4. Run database migrations to scaffold the tables
-        // EF Core will run migrations within the context of the set 'search_path',
-        // creating the tables and __EFMigrationsHistory inside the new tenant schema.
+        // 3. Run migrations.
+        // EF Core maps tables to the tenantSchema via OnModelCreating,
+        // and records execution in {tenantSchema}.__EFMigrationsHistory.
         await context.Database.MigrateAsync();
     }
 }
@@ -190,7 +232,7 @@ public class TenantProvisioningService(
 
 ## 5. Architectural Verification via `NetArchTest`
 
-Maintain strict boundary controls between code namespaces:
+Maintain namespace separation rules in `Monolith.Tests/`:
 
 ```csharp
 using NetArchTest.Rules;

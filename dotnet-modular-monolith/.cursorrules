@@ -6,22 +6,24 @@
 - **UI Framework**: Blazor Web App (Interactive Server / SSR).
 - **Database**: EF Core 10, PostgreSQL.
 - **Architecture**: Single-Project Modular Monolith + Multi-Tenancy.
-- **Multi-Tenancy Strategy**: **Schema-per-Tenant** using PostgreSQL **`search_path`**.
+- **Multi-Tenancy Strategy**: **Schema-per-Tenant** using dynamic EF Core schema-qualified mapping (`ToTable("table", schema)`) and per-schema Migrations History.
 - **Module Separation**: **Table Prefix per Module** (e.g., `catalog_products`, `ordering_orders`).
 
 # Schema-per-Tenant & Database Boundaries
-To implement schema-per-tenant efficiently in PostgreSQL without EF Core model cache overhead:
-1. **PostgreSQL `search_path` Scoping**:
+To implement schema-per-tenant with dynamic schema-qualified mapping:
+1. **Schema-Qualified Table Mapping**:
    - Every tenant is assigned a dedicated schema (e.g., `tenant_a`, `tenant_b`).
-   - We do **not** define schema names in EF Core (`OnModelCreating`). Tables are mapped as schema-less names: `catalog_products`, `ordering_orders`.
-   - On connection open, a `DbConnectionInterceptor` executes:
-     `SET search_path TO {tenant_schema}, public;`
-   - PostgreSQL dynamically routes queries to the active tenant's schema. Global shared tables (e.g. tenant registries) can live in the `public` schema.
-2. **Module Separation (Table Prefixes)**:
+   - Tables must be explicitly mapped in EF Core `OnModelCreating` using the format: `ToTable("table_name", schema)`.
+   - The active tenant schema name is injected into the DbContext at runtime via `ITenantProvider.GetTenantSchema()`.
+2. **Model Caching with Dynamic Schemas**:
+   - Since the schema changes dynamically, a custom `IModelCacheKeyFactory` **must** be implemented and registered. This tells EF Core to cache different database models for different tenant schemas:
+     `return (context.GetType(), tenantContext.TenantSchema, designTime);`
+3. **Module Separation (Table Prefixes)**:
    - Within each tenant schema, module boundaries are kept clear using prefixes: `[module]_[table]`.
    - E.g., `catalog_products`, `ordering_orders`.
-3. **No Model Cache Bloat**:
-   - Because all queries are generated as schema-less (e.g. `SELECT * FROM catalog_products`), EF Core uses a single cached database model for all tenants, preventing memory leaks and high CPU overhead at startup.
+4. **Data Isolation & Column Schema**:
+   - No `tenant_id` columns are required in tables. Schema boundaries provide full physical data isolation.
+   - Cross-tenant queries are strictly prohibited in the application context.
 
 # Single-Project Directory Structure
 ```
@@ -30,11 +32,11 @@ Monolith/
 │   └── [ModuleName]/
 │       ├── Domain/                       # Domain models (internal)
 │       ├── Application/                  # MediatR handlers, public DTOs, interface contracts
-│       ├── Infrastructure/               # Module DbContext, Repositories (internal)
+│       ├── Infrastructure/               # Module DbContext, Migrations, Repositories (internal)
 │       └── UI/                           # Blazor Pages, endpoints (Minimal APIs)
 ├── Shared/
 │   ├── Domain/                           # Common DDD classes & ITenantProvider interface
-│   ├── Infrastructure/                   # TenantConnectionInterceptor, TenantMigrationService
+│   ├── Infrastructure/                   # TenantModelCacheKeyFactory, TenantProvisioningService
 │   └── UI/                               # Common layout templates
 ├── Program.cs                            # Unified startup: registers TenantProvider, DbContexts, maps UI
 └── Monolith.csproj                       # Single project file
@@ -43,10 +45,31 @@ Monolith/
 # Coding Rules for Tenant-Aware Code
 1. **Tenant Selection**:
    - Always resolve the tenant context via `ITenantProvider.GetTenantSchema()`.
-2. **DbContext Rules**:
-   - Map tables using `ToTable("[module]_[tablename]")` in `OnModelCreating`. Do **not** use `.HasDefaultSchema()` or specify schema parameters in `.ToTable()`.
-3. **Migrations & Tenant Provisioning**:
-   - Each tenant schema maintains its own `__EFMigrationsHistory` table.
+   - Store in scoped context for request lifecycle.
+
+2. **DbContext Mapping Rules**:  
+   - Always map tables using: `ToTable("table_name", tenantSchema)`
+   - Do NOT rely solely on PostgreSQL search_path.
+   - Do NOT mix tenant_id filtering if using schema isolation.
+
+3. **Schema Strategy**:
+   - Each tenant has a dedicated schema: 
+     - `tenant_123.catalog_products`
+     - `tenant_123.ordering_orders`
+   - All module tables exist inside the tenant schema.
+
+4. **Migrations & Tenant Provisioning**:
    - When onboarding a new tenant:
      1. Create the schema: `CREATE SCHEMA {tenant_schema};`
-     2. Run EF Core migrations against the new schema by setting the connection `search_path` to the tenant's schema.
+     2. Run migrations with schema: `context.Database.Migrate()`
+     3. Ensure migrations history table is per-schema: `__EFMigrationsHistory` must exist inside the tenant's schema.
+
+5. **Connection Safety (Critical)**:
+   - Do NOT rely on global search_path with connection pooling.
+   - Prefer schema-qualified mapping via EF Core.
+   - If using search_path: use `SET LOCAL` inside transaction scope only.
+
+6. **Isolation Rules**:
+   - No tenant_Id column required.
+   - Schema provides full isolation.
+   - Never query cross-tenant schemas directly.

@@ -1,0 +1,52 @@
+# .cursorrules for .NET 10 Single-Project Blazor Modular Monolith (Schema-per-Tenant)
+
+# Context & Tech Stack
+- **Framework**: .NET 10 (LTS)
+- **Language**: C# 14
+- **UI Framework**: Blazor Web App (Interactive Server / SSR).
+- **Database**: EF Core 10, PostgreSQL.
+- **Architecture**: Single-Project Modular Monolith + Multi-Tenancy.
+- **Multi-Tenancy Strategy**: **Schema-per-Tenant** using PostgreSQL **`search_path`**.
+- **Module Separation**: **Table Prefix per Module** (e.g., `catalog_products`, `ordering_orders`).
+
+# Schema-per-Tenant & Database Boundaries
+To implement schema-per-tenant efficiently in PostgreSQL without EF Core model cache overhead:
+1. **PostgreSQL `search_path` Scoping**:
+   - Every tenant is assigned a dedicated schema (e.g., `tenant_a`, `tenant_b`).
+   - We do **not** define schema names in EF Core (`OnModelCreating`). Tables are mapped as schema-less names: `catalog_products`, `ordering_orders`.
+   - On connection open, a `DbConnectionInterceptor` executes:
+     `SET search_path TO {tenant_schema}, public;`
+   - PostgreSQL dynamically routes queries to the active tenant's schema. Global shared tables (e.g. tenant registries) can live in the `public` schema.
+2. **Module Separation (Table Prefixes)**:
+   - Within each tenant schema, module boundaries are kept clear using prefixes: `[module]_[table]`.
+   - E.g., `catalog_products`, `ordering_orders`.
+3. **No Model Cache Bloat**:
+   - Because all queries are generated as schema-less (e.g. `SELECT * FROM catalog_products`), EF Core uses a single cached database model for all tenants, preventing memory leaks and high CPU overhead at startup.
+
+# Single-Project Directory Structure
+```
+Monolith/
+├── Modules/
+│   └── [ModuleName]/
+│       ├── Domain/                       # Domain models (internal)
+│       ├── Application/                  # MediatR handlers, public DTOs, interface contracts
+│       ├── Infrastructure/               # Module DbContext, Repositories (internal)
+│       └── UI/                           # Blazor Pages, endpoints (Minimal APIs)
+├── Shared/
+│   ├── Domain/                           # Common DDD classes & ITenantProvider interface
+│   ├── Infrastructure/                   # TenantConnectionInterceptor, TenantMigrationService
+│   └── UI/                               # Common layout templates
+├── Program.cs                            # Unified startup: registers TenantProvider, DbContexts, maps UI
+└── Monolith.csproj                       # Single project file
+```
+
+# Coding Rules for Tenant-Aware Code
+1. **Tenant Selection**:
+   - Always resolve the tenant context via `ITenantProvider.GetTenantSchema()`.
+2. **DbContext Rules**:
+   - Map tables using `ToTable("[module]_[tablename]")` in `OnModelCreating`. Do **not** use `.HasDefaultSchema()` or specify schema parameters in `.ToTable()`.
+3. **Migrations & Tenant Provisioning**:
+   - Each tenant schema maintains its own `__EFMigrationsHistory` table.
+   - When onboarding a new tenant:
+     1. Create the schema: `CREATE SCHEMA {tenant_schema};`
+     2. Run EF Core migrations against the new schema by setting the connection `search_path` to the tenant's schema.

@@ -73,3 +73,29 @@ Monolith/
    - No tenant_Id column required.
    - Schema provides full isolation.
    - Never query cross-tenant schemas directly.
+
+7. DbContext Lifetime:
+   - One DbContext per request per tenant
+   - Never reuse across tenants
+
+8. Tenant Context Consistency:
+   - Resolve once per request
+   - No runtime switching
+   - Required for background jobs
+
+9. Tenant Provisioning:
+   - Centralized service required
+   - Create schema + run migrations
+   - No manual DB changes
+
+10. Schema Consistency:
+   - All modules must maintain consistent schema structure
+   - Avoid partial migrations per tenant
+
+11. Scalability:
+   - Monitor number of schemas
+   - Plan hybrid model beyond hundreds of tenants
+
+12. Cross-Tenant Rule:
+   - No cross-schema queries at runtime
+   - Only admin-level controlled queries allowed

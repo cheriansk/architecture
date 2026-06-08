@@ -1,0 +1,373 @@
+# Architecture Enforcement & Automation
+To prevent developers from violating these structural rules, we enforce them via custom **Roslyn Analyzers** and **Architecture Tests** distributed as NuGet packages.
+
+## Rule 1: Roslyn Analyzers Project Specification (Private NuGet Package)
+When generating or modifying the Roslyn Analyzer project, follow these technical constraints:
+1. **Target Framework**: Must target `netstandard2.0` (required for compiler/IDE integration).
+2. **MSBuild Packaging Properties**:
+   - `<IncludeBuildOutput>false</IncludeBuildOutput>` (prevents the analyzer DLL from being compiled as a direct reference).
+   - `<SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>`
+   - `<GeneratePackageOnBuild>true</GeneratePackageOnBuild>`
+   - `<DevelopmentDependency>true</DevelopmentDependency>`
+   - Include DLL under path: `analyzers/dotnet/cs`
+3. **Roslyn Code Rules**:
+   - **MONO001 (Module Boundary Violation)**:
+     - Registers on `SyntaxKind.IdentifierName`.
+     - Resolves `SemanticModel.GetSymbolInfo(node)`.
+     - If source code in `Monolith.Modules.[ModuleA]` references a type/member in `Monolith.Modules.[ModuleB].Domain` or `Monolith.Modules.[ModuleB].Infrastructure` (where `ModuleA != ModuleB`), report a build compilation error.
+     - Exclude the root namespace `Monolith` or types outside `Monolith.Modules` (to allow startup configuration in `Program.cs`).
+   - **MONO002 (EF Core Table Mapping)**:
+     - Registers on `SyntaxKind.InvocationExpression` checking calls to `ToTable`.
+     - Ensures the invocation is the EF Core extension method `RelationalEntityTypeBuilderExtensions.ToTable`.
+     - Checks if the number of arguments is at least 2 (ensures schema name is passed).
+     - Evaluates the first argument (table name). If it's a constant/literal, ensures it starts with `{moduleName.ToLower()}_`.
+   - **MONO003 (DbContext Structure)**:
+     - Registers on `SymbolKind.NamedType`.
+     - For any class inheriting from `Microsoft.EntityFrameworkCore.DbContext` within `Monolith.Modules.*`, it must be declared as `internal` and implement `Monolith.Shared.Infrastructure.ITenantDbContext`.
+
+## Rule 2: Architecture Tests Project Specification (Private NuGet Package)
+When generating the Architecture Test package (`Monolith.ArchitectureRules`):
+1. **Target Framework**: Target `.NET 10.0`.
+2. **Dependencies**: Reference `NetArchTest.Rules` (version 2.5.0+).
+3. **Reusable API**: Expose a static utility `ArchitectureEnforcer.Verify(Assembly monolithAssembly)` which returns a result object carrying:
+   - `bool IsSuccessful`
+   - `List<string> Failures`
+4. **Enforced Rules in NetArchTest**:
+   - All types residing in namespaces matching `Monolith.Modules.*.Domain` or `Monolith.Modules.*.Infrastructure` must not be `public`.
+   - For each module namespace `Monolith.Modules.[Module]`, verify it has no dependencies on namespaces matching `Monolith.Modules.[OtherModule].Domain` or `Monolith.Modules.[OtherModule].Infrastructure`.
+
+## Rule 3: NuGet Packaging & Consuming in Monoliths
+1. **Packing command**: Run `dotnet pack -c Release` to generate `.nupkg` files in bin directories.
+2. **Adding to a Monolith**: Reference these packages in the monolith's `.csproj` files:
+   ```xml
+   <!-- In Monolith.csproj (to run Roslyn compilation scans) -->
+   <ItemGroup>
+     <PackageReference Include="Monolith.Analyzers" Version="1.0.0">
+       <PrivateAssets>all</PrivateAssets>
+       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+     </PackageReference>
+   </ItemGroup>
+
+   <!-- In Monolith.Tests.csproj (to run assembly runtime architecture scans) -->
+   <ItemGroup>
+     <PackageReference Include="Monolith.ArchitectureRules" Version="1.0.0" />
+   </ItemGroup>
+   ```
+3. **Running the tests**: The developer simply creates a unit test class in their monolith test project:
+   ```csharp
+   [Fact]
+   public void EnforceArchitecture()
+   {
+       var result = ArchitectureEnforcer.Verify(typeof(Program).Assembly);
+       Assert.True(result.IsSuccessful, result.ErrorMessage);
+   }
+   ```
+
+## Standard Boilerplate Templates for Generation
+Use the following source code patterns when generating the projects:
+
+### Template A: Monolith.Analyzers.csproj
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>12.0</LangVersion>
+    <IsPackable>true</IsPackable>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <DevelopmentDependency>true</DevelopmentDependency>
+    <NoPackageAnalysis>true</NoPackageAnalysis>
+    <PackageId>Monolith.Analyzers</PackageId>
+    <Version>1.0.0</Version>
+    <Description>Roslyn Analyzers enforcing Blazor Modular Monolith rules.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="$(OutputPath)\$(AssemblyName).dll" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
+  </ItemGroup>
+</Project>
+```
+
+### Template B: ModuleBoundaryAnalyzer.cs (MONO001)
+```csharp
+using System.Collections.Immutable;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Diagnostics;
+
+namespace Monolith.Analyzers;
+
+[DiagnosticAnalyzer(LanguageNames.CSharp)]
+public class ModuleBoundaryAnalyzer : DiagnosticAnalyzer
+{
+    public const string DiagnosticId = "MONO001";
+    private static readonly DiagnosticDescriptor Rule = new(
+        DiagnosticId, "Cross-module boundary violation",
+        "Module '{0}' cannot reference '{1}' from module '{2}'", "Architecture",
+        DiagnosticSeverity.Error, isEnabledByDefault: true);
+
+    public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics => ImmutableArray.Create(Rule);
+
+    public override void Initialize(AnalysisContext context)
+    {
+        context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.None);
+        context.EnableConcurrentExecution();
+        context.RegisterSyntaxNodeAction(AnalyzeIdentifier, SyntaxKind.IdentifierName);
+    }
+
+    private static void AnalyzeIdentifier(SyntaxNodeAnalysisContext context)
+    {
+        var identifier = (IdentifierNameSyntax)context.Node;
+        var name = identifier.Identifier.Text;
+        if (string.IsNullOrEmpty(name) || char.IsLower(name[0])) return;
+
+        var symbol = context.SemanticModel.GetSymbolInfo(identifier, context.CancellationToken).Symbol;
+        if (symbol == null) return;
+
+        var targetNamespace = (symbol is INamedTypeSymbol || symbol is ITypeSymbol)
+            ? symbol.ContainingNamespace?.ToDisplayString()
+            : symbol.ContainingType?.ContainingNamespace?.ToDisplayString();
+
+        if (string.IsNullOrEmpty(targetNamespace) || !targetNamespace.StartsWith("Monolith.Modules.")) return;
+
+        var sourceSymbol = context.ContainingSymbol;
+        if (sourceSymbol == null) return;
+        var sourceNamespace = sourceSymbol.ContainingNamespace?.ToDisplayString();
+        if (string.IsNullOrEmpty(sourceNamespace) || !sourceNamespace.StartsWith("Monolith.Modules.")) return;
+
+        var sourceModule = GetModuleName(sourceNamespace);
+        var targetModule = GetModuleName(targetNamespace);
+        if (sourceModule == null || targetModule == null || sourceModule == targetModule) return;
+
+        if (targetNamespace.Contains(".Domain") || targetNamespace.Contains(".Infrastructure"))
+        {
+            context.ReportDiagnostic(Diagnostic.Create(Rule, identifier.GetLocation(), sourceModule, symbol.ToDisplayString(), targetModule));
+        }
+    }
+
+    private static string? GetModuleName(string ns) => ns.Split('.').Length > 2 ? ns.Split('.')[2] : null;
+}
+```
+
+### Template C: DbContextToTableAnalyzer.cs (MONO002)
+```csharp
+using System.Collections.Immutable;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Diagnostics;
+
+namespace Monolith.Analyzers;
+
+[DiagnosticAnalyzer(LanguageNames.CSharp)]
+public class DbContextToTableAnalyzer : DiagnosticAnalyzer
+{
+    public const string DiagnosticId = "MONO002";
+    private static readonly DiagnosticDescriptor Rule = new(
+        DiagnosticId, "ToTable must specify schema and use module table prefix",
+        "Table mapping for '{0}' must specify a tenant schema and the table name must be prefixed with '{1}'", "Database",
+        DiagnosticSeverity.Error, isEnabledByDefault: true);
+
+    public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics => ImmutableArray.Create(Rule);
+
+    public override void Initialize(AnalysisContext context)
+    {
+        context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.None);
+        context.EnableConcurrentExecution();
+        context.RegisterSyntaxNodeAction(AnalyzeInvocation, SyntaxKind.InvocationExpression);
+    }
+
+    private static void AnalyzeInvocation(SyntaxNodeAnalysisContext context)
+    {
+        var invocation = (InvocationExpressionSyntax)context.Node;
+        if (invocation.Expression is MemberAccessExpressionSyntax memberAccess && memberAccess.Name.Identifier.Text == "ToTable")
+        {
+            var symbol = context.SemanticModel.GetSymbolInfo(invocation, context.CancellationToken).Symbol as IMethodSymbol;
+            if (symbol == null || symbol.ContainingType?.ToDisplayString() != "Microsoft.EntityFrameworkCore.RelationalEntityTypeBuilderExtensions") return;
+
+            var argumentList = invocation.ArgumentList;
+            if (argumentList == null || argumentList.Arguments.Count == 0) return;
+
+            var containingSymbol = context.ContainingSymbol;
+            if (containingSymbol == null) return;
+            var ns = containingSymbol.ContainingNamespace?.ToDisplayString();
+            if (string.IsNullOrEmpty(ns) || !ns.StartsWith("Monolith.Modules.")) return;
+
+            var moduleName = ns.Split('.').Length > 2 ? ns.Split('.')[2] : null;
+            if (moduleName == null) return;
+            var expectedPrefix = moduleName.ToLowerInvariant() + "_";
+
+            if (argumentList.Arguments.Count < 2)
+            {
+                context.ReportDiagnostic(Diagnostic.Create(Rule, invocation.GetLocation(), symbol.Name, expectedPrefix));
+                return;
+            }
+
+            var tableNameArg = argumentList.Arguments[0];
+            var constantValue = context.SemanticModel.GetConstantValue(tableNameArg.Expression, context.CancellationToken);
+            if (constantValue.HasValue && constantValue.Value is string tableName && !tableName.StartsWith(expectedPrefix, System.StringComparison.Ordinal))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(Rule, tableNameArg.GetLocation(), tableName, expectedPrefix));
+            }
+        }
+    }
+}
+```
+
+### Template D: DbContextClassAnalyzer.cs (MONO003)
+```csharp
+using System.Collections.Immutable;
+using System.Linq;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Diagnostics;
+
+namespace Monolith.Analyzers;
+
+[DiagnosticAnalyzer(LanguageNames.CSharp)]
+public class DbContextClassAnalyzer : DiagnosticAnalyzer
+{
+    public const string DiagnosticId = "MONO003";
+    private static readonly DiagnosticDescriptor Rule = new(
+        DiagnosticId, "DbContext class implementation violation",
+        "DbContext class '{0}' must be declared as internal and implement ITenantDbContext", "Architecture",
+        DiagnosticSeverity.Error, isEnabledByDefault: true);
+
+    public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics => ImmutableArray.Create(Rule);
+
+    public override void Initialize(AnalysisContext context)
+    {
+        context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.None);
+        context.EnableConcurrentExecution();
+        context.RegisterSymbolAction(AnalyzeNamedType, SymbolKind.NamedType);
+    }
+
+    private static void AnalyzeNamedType(SymbolAnalysisContext context)
+    {
+        var typeSymbol = (INamedTypeSymbol)context.Symbol;
+        if (typeSymbol.TypeKind != TypeKind.Class) return;
+
+        var isDbContext = typeSymbol.BaseType != null && typeSymbol.BaseType.ToDisplayString() == "Microsoft.EntityFrameworkCore.DbContext";
+        if (!isDbContext)
+        {
+            var current = typeSymbol.BaseType;
+            while (current != null)
+            {
+                if (current.ToDisplayString() == "Microsoft.EntityFrameworkCore.DbContext") { isDbContext = true; break; }
+                current = current.BaseType;
+            }
+        }
+        if (!isDbContext) return;
+
+        var ns = typeSymbol.ContainingNamespace?.ToDisplayString();
+        if (string.IsNullOrEmpty(ns) || !ns.StartsWith("Monolith.Modules.")) return;
+
+        bool implementsTenantDbContext = typeSymbol.AllInterfaces.Any(i => i.ToDisplayString() == "Monolith.Shared.Infrastructure.ITenantDbContext");
+        bool isInternal = typeSymbol.DeclaredAccessibility == Accessibility.Internal;
+
+        if (!isInternal || !implementsTenantDbContext)
+        {
+            var location = typeSymbol.Locations.FirstOrDefault() ?? Location.None;
+            context.ReportDiagnostic(Diagnostic.Create(Rule, location, typeSymbol.Name));
+        }
+    }
+}
+```
+
+### Template E: ArchitectureRules.csproj
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>true</IsPackable>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageId>Monolith.ArchitectureRules</PackageId>
+    <Version>1.0.0</Version>
+    <Description>Runtime Architecture verification rules using NetArchTest for Blazor Monolith.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="NetArchTest.Rules" Version="2.5.0" />
+  </ItemGroup>
+</Project>
+```
+
+### Template F: ArchitectureEnforcer.cs
+```csharp
+using NetArchTest.Rules;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+
+namespace Monolith.ArchitectureRules;
+
+public class ArchitectureEnforcerResult
+{
+    public bool IsSuccessful { get; set; }
+    public List<string> Failures { get; set; } = new();
+    public string ErrorMessage => string.Join(Environment.NewLine, Failures);
+}
+
+public static class ArchitectureEnforcer
+{
+    public static ArchitectureEnforcerResult Verify(Assembly monolithAssembly)
+    {
+        var result = new ArchitectureEnforcerResult { IsSuccessful = true };
+
+        // 1. Module Domain and Infrastructure classes must be internal (non-public)
+        var internalTypesResult = Types.InAssembly(monolithAssembly)
+            .That().ResideInNamespaceStartingWith("Monolith.Modules.")
+            .And().ResideInNamespaceEndingWith(".Domain")
+            .Or().ResideInNamespaceEndingWith(".Infrastructure")
+            .Should().NotBePublic()
+            .GetResult();
+
+        if (!internalTypesResult.IsSuccessful && internalTypesResult.FailingTypes != null)
+        {
+            result.IsSuccessful = false;
+            foreach (var type in internalTypesResult.FailingTypes)
+                result.Failures.Add($"Type '{type.FullName}' violates accessibility rules: module Domain and Infrastructure classes must be internal.");
+        }
+
+        // 2. Cross-module boundary isolation: Modules should not reference internal namespaces of other modules
+        var allTypes = Types.InAssembly(monolithAssembly).GetTypes();
+        var moduleNames = allTypes
+            .Select(t => t.Namespace != null && t.Namespace.StartsWith("Monolith.Modules.") && t.Namespace.Split('.').Length > 2 ? t.Namespace.Split('.')[2] : null)
+            .Where(name => name != null)
+            .Distinct()
+            .ToList();
+
+        foreach (var module in moduleNames)
+        {
+            var forbiddenNamespaces = moduleNames
+                .Where(m => m != module)
+                .SelectMany(m => new[] { $"Monolith.Modules.{m}.Domain", $"Monolith.Modules.{m}.Infrastructure" })
+                .ToArray();
+
+            if (forbiddenNamespaces.Length == 0) continue;
+
+            var moduleIsolationResult = Types.InAssembly(monolithAssembly)
+                .That().ResideInNamespaceStartingWith($"Monolith.Modules.{module}.")
+                .ShouldNot()
+                .HaveDependencyOnAny(forbiddenNamespaces)
+                .GetResult();
+
+            if (!moduleIsolationResult.IsSuccessful && moduleIsolationResult.FailingTypes != null)
+            {
+                result.IsSuccessful = false;
+                foreach (var type in moduleIsolationResult.FailingTypes)
+                    result.Failures.Add($"Type '{type.FullName}' in Module '{module}' violates boundary rules: referencing internal namespaces of another module is prohibited.");
+            }
+        }
+
+        return result;
+    }
+}
+```
